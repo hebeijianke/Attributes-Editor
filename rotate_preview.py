@@ -77,12 +77,92 @@ def _search_best_angle(mask: np.ndarray, target: str = "horizontal") -> float:
     return float(best_angle)
 
 
+def _alignment_and_upright_score(rotated_mask: np.ndarray, target: str) -> float:
+    # Alignment: prefer strong structure along target axis
+    row_proj = np.sum(rotated_mask, axis=1, dtype=np.float64)
+    col_proj = np.sum(rotated_mask, axis=0, dtype=np.float64)
+    row_proj = row_proj - row_proj.mean()
+    col_proj = col_proj - col_proj.mean()
+    var_row = float(np.dot(row_proj, row_proj))
+    var_col = float(np.dot(col_proj, col_proj))
+    if target == "horizontal":
+        align_score = var_row - var_col
+    else:
+        align_score = var_col - var_row
+
+    # Uprightness: prefer more foreground mass in lower half than upper half
+    h = rotated_mask.shape[0]
+    upper = float(np.sum(rotated_mask[: h // 2] == 255))
+    lower = float(np.sum(rotated_mask[h // 2 :] == 255))
+    total = upper + lower + 1e-6
+    upright_score = (lower - upper) / total  # [-1, 1]
+
+    # Combined score with small weight on uprightness to avoid dominating
+    return align_score + 0.05 * upright_score
+
+
+def _search_best_clockwise(mask: np.ndarray, target: str = "horizontal") -> float:
+    # Evaluate around clockwise bases: 0, -90, -180, -270 degrees
+    def local_sweep(base: float) -> tuple:
+        # Keep total angle <= 0 to ensure clockwise-only
+        best_a, best_s = None, -1e30
+        # base 0 only allows non-positive deltas; others allow ±10 while keeping total <= 0
+        delta_starts = -10.0
+        delta_ends = 0.0 if base == 0.0 else 10.0
+        step = 1.0
+        a = base + delta_starts
+        while a <= base + delta_ends + 1e-9:
+            if a > 0.0:
+                a += step
+                continue
+            rotated = _rotate_image_single_channel(mask, a)
+            s = _alignment_and_upright_score(rotated, target)
+            if s > best_s:
+                best_s, best_a = s, a
+            a += step
+        # refine around best
+        if best_a is not None:
+            fine_start = max(best_a - 1.0, base + delta_starts)
+            fine_end = min(best_a + 1.0, base + delta_ends)
+            a = fine_start
+            while a <= fine_end + 1e-9:
+                if a > 0.0:
+                    a += 0.2
+                    continue
+                rotated = _rotate_image_single_channel(mask, a)
+                s = _alignment_and_upright_score(rotated, target)
+                if s > best_s:
+                    best_s, best_a = s, a
+                a += 0.2
+        return best_a, best_s
+
+    best_angle, best_score = None, -1e30
+    for base in (0.0, -90.0, -180.0, -270.0):
+        a, s = local_sweep(base)
+        if a is not None and s > best_score:
+            best_angle, best_score = a, s
+
+    if best_angle is None:
+        return 0.0
+
+    # Snap near canonical angles
+    for snap in (0.0, -90.0, -180.0, -270.0):
+        if abs(best_angle - snap) < 0.3:
+            best_angle = float(snap)
+            break
+
+    # Normalize to (-360, 0] to be clearly clockwise
+    while best_angle > 0.0:
+        best_angle -= 360.0
+    while best_angle <= -360.0:
+        best_angle += 360.0
+    return float(best_angle)
+
+
 def estimate_correction_angle(image_bgr: np.ndarray, target: str = "horizontal") -> float:
     mask = _prepare_binary_mask(image_bgr)
-    if target == "vertical":
-        return _search_best_angle(mask, target="vertical")
-    else:
-        return _search_best_angle(mask, target="horizontal")
+    # Clockwise-only search with anti-90 and anti-180 heuristics
+    return _search_best_clockwise(mask, target=target)
 
 
 def rotate_image(image_bgr: np.ndarray, angle_deg: float) -> np.ndarray:
